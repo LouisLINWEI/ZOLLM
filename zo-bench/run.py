@@ -70,6 +70,7 @@ class OurArguments(TrainingArguments):
     ## - zo_conserv: zeroth-order SGD conservative training
     ## - zo_adam: zeroth-order Adam training
     ## - zo_sign_opt: zeroth-order sign sgd training
+    ## - agzo: activation-guided zeroth-order training  # AGZO: 新增trainer选项
     ## - forward_grad: forward gradient
     optimizer: str = "adamw"
     ## options
@@ -154,6 +155,13 @@ class OurArguments(TrainingArguments):
     ## - mlp-attn: perturb one mlp/attention layer at a time
     ## - linear: perturb one linear layer at a time
     """
+
+    # AGZO: power iteration steps for computing activation principal direction
+    agzo_power_iter_steps: int = 5
+    # AGZO: empty CUDA cache every N steps (0=disable)
+    agzo_empty_cache_steps: int = 1
+    # AGZO: debug flag to log per-layer memory usage during basis collection
+    agzo_debug_memory: bool = False
 
 
 def parse_args():
@@ -615,6 +623,12 @@ def main():
     else:
         args.mode = "ft"
     args.tag = f"{args.trainer}-{args.task_name}-{args.template_ver}-{args.model_name.split('/')[-1]}-OPTIM_{args.mode}-STEP{args.max_steps}-{args.optimizer}-LR{args.learning_rate}-{args.lr_scheduler_type}-ZOEPS{args.zo_eps}-Q{args.q}"
+    if args.trainer == "agzo":
+        args.tag += f"-AGZO_PI{args.agzo_power_iter_steps}"  # AGZO: 记录power iteration次数
+        if args.agzo_empty_cache_steps > 0:
+            args.tag += f"-AGZO_EC{args.agzo_empty_cache_steps}"  # AGZO: 记录缓存清理频率
+        if args.agzo_debug_memory:
+            args.tag += "-AGZO_DBG"
     args.tag = "momen" + args.tag if args.momentum > 0 else args.tag
     args.tag = f"sparse_grad-{args.gradient_sparsity}-{args.sparse_gradient_group}-{args.sparse_gradient_resample_steps}-" + args.tag if args.gradient_sparsity is not None else args.tag
     args.tag = f"module_perturb-{args.perturbed_module_level}-" + args.tag if args.module_wise_perturbation else args.tag
@@ -624,6 +638,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     args.logging_dir = os.path.join(args.output_dir, "logs")
     os.makedirs(args.logging_dir, exist_ok=True)
+
+    # If user only needs metrics, disable checkpoint saving
+    args.save_strategy = "no"  # user requests no checkpoints to save disk usage
+    args.save_model = False
+    args.save_total_limit = 0
+    args.load_best_model_at_end = False
 
     wandb.init(project='zo-bench', name=args.tag, config=args)
 
@@ -695,12 +715,12 @@ def main():
                 # Zero-shot / in-context learning
                 metrics = framework.evaluate(train_samples, eval_samples)
             logger.info(metrics)
-            wandb.log(metrics)
+            wandb.log(metrics, step=framework.trainer.state.global_step if hasattr(framework, "trainer") else None)
 
             if not args.no_eval:
                 logger.info("===== Train set %d =====" % train_set_seed)
                 logger.info(metrics)
-                wandb.log(metrics)
+                wandb.log(metrics, step=framework.trainer.state.global_step if hasattr(framework, "trainer") else None)
                 if args.local_rank <= 0:
                     write_metrics_to_file(metrics, "result/" + result_file_tag(
                         args) + f"-trainset{train_set_id}.json" if args.result_file is None else args.result_file)
@@ -717,7 +737,7 @@ def main():
             eval_samples = task.valid_samples
         metrics = framework.evaluate(train_sets, eval_samples, one_train_set_per_eval_sample=True)
         logger.info(metrics)
-        wandb.log(metrics)
+        wandb.log(metrics, step=framework.trainer.state.global_step if hasattr(framework, "trainer") else None)
         if args.local_rank <= 0:
             write_metrics_to_file(metrics, "result/" + result_file_tag(
                 args) + "-onetrainpereval.json" if args.result_file is None else args.result_file)

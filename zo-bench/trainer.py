@@ -135,6 +135,16 @@ class OurTrainer(Trainer):
         self.eval_samples = eval_samples
         self.perturb_module_regex = perturb_module_regex
 
+        # AGZO: initialize bookkeeping structures when使用新的激活引导Zeroth-Order训练器
+        self.agzo_enabled = getattr(self.args, "trainer", "") == "agzo"
+        if self.agzo_enabled:
+            self._agzo_hooks_registered = False
+            self.agzo_hooks = []
+            self.agzo_layer_inputs = {}
+            self.agzo_u = {}
+            self.agzo_collecting = False
+            self._agzo_missing_activation_warned = False
+
     def _inner_training_loop(
             self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -503,6 +513,8 @@ class OurTrainer(Trainer):
                         tr_loss_step = self.zo_step_v1(model, inputs)
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
+                elif args.trainer == "agzo":  # AGZO: 新增训练流程
+                    tr_loss_step = self.agzo_step(model, inputs)
                 elif args.trainer == "zo_conserv":
                     tr_loss_step = self.zo_conserv_step(model, inputs)
                 elif args.trainer == "forward_grad":
@@ -541,7 +553,7 @@ class OurTrainer(Trainer):
                         and (step + 1) == steps_in_epoch
                 ):
                     # MeZO added: update model with the estimated gradient
-                    if args.trainer in ["zo_sgd", "zo_adam", "zo_sign_opt", "zo_conserv"]:
+                    if args.trainer in ["zo_sgd", "zo_adam", "zo_sign_opt", "zo_conserv", "agzo"]:  # AGZO: 纳入学习率调度
                         self.zo_update(model)
                     elif args.trainer == "forward_grad":
                         self.forward_grad_update(model)
@@ -569,7 +581,8 @@ class OurTrainer(Trainer):
                     test_metrics = self.evaluate_func([], self.eval_samples)
                     if "accuracy" in test_metrics:
                         self.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]})
-                        wandb.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]})
+                        wandb.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]},
+                                   step=self.state.global_step)
                     else:
                         keys = list(test_metrics.keys())
                         log_dict = {}
@@ -577,7 +590,7 @@ class OurTrainer(Trainer):
                             log_dict['test_' + k] = test_metrics[k]
                             log_dict['val_' + k] = val_metrics[k]
                         self.log(log_dict)
-                        wandb.log(log_dict)
+                        wandb.log(log_dict, step=self.state.global_step)
 
                 max_memory_allocated = 0
                 for device_id in range(torch.cuda.device_count()):
@@ -586,7 +599,18 @@ class OurTrainer(Trainer):
                 self.log({"peak_mem": max_memory_allocated / 1024 ** 3,
                           "step_consumption": train_step_duration * 1000})
                 wandb.log({"peak_mem": max_memory_allocated / 1024 ** 3,
-                           "step_consumption": train_step_duration * 1000})
+                           "step_consumption": train_step_duration * 1000},
+                          step=self.state.global_step)
+
+                # AGZO: optionally empty CUDA cache to mitigate peak growth
+                if (
+                        args.trainer == "agzo"
+                        and getattr(args, "agzo_empty_cache_steps", 0) > 0
+                        and total_steps % args.agzo_empty_cache_steps == 0
+                        and torch.cuda.is_available()
+                ):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
 
             if step < 0:
                 # Why would this happen? I don't know, but let's be safe.
@@ -731,6 +755,171 @@ class OurTrainer(Trainer):
             if grad_sparsity is not None:
                 z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
             param.data = param.data + scaling_factor * z * self.args.zo_eps
+
+    # AGZO: helper methods for activation-guided perturbations ---------------------------------
+    def _ensure_agzo_hooks(self):
+        if not getattr(self, "agzo_enabled", False):
+            return
+        if getattr(self, "_agzo_hooks_registered", False):
+            return
+        self._register_agzo_hooks()
+
+    def _register_agzo_hooks(self):
+        """AGZO: register forward hooks to capture layer activations for principal direction."""
+        params_dict = dict(self.model.named_parameters())
+        self.agzo_param_map = {}
+        for module_name, module in self.model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            param_name = f"{module_name}.weight" if module_name else "weight"
+            param = params_dict.get(param_name)
+            if param is None or not param.requires_grad:
+                continue
+            hook = module.register_forward_hook(self._make_agzo_hook(param_name))
+            self.agzo_hooks.append(hook)
+            self.agzo_param_map[param_name] = param
+        self._agzo_hooks_registered = True
+
+    def _make_agzo_hook(self, param_name):
+        """AGZO: create forward hook that computes u_l on-the-fly."""
+
+        def _hook(module, inputs, output):
+            if not self.agzo_collecting:
+                return
+            activation = None
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    activation = inp
+                    break
+            if activation is None:
+                return
+            direction = self._agzo_compute_direction(activation.detach(), param_name)
+            if direction is not None:
+                self.agzo_u[param_name] = direction
+
+        return _hook
+
+    def _agzo_compute_direction(self, activation: torch.Tensor, param_name: str):
+        """AGZO: compute principal direction using power iteration on activations."""
+        if activation.numel() == 0:
+            return None
+        if activation.dim() == 0:
+            return None
+        param = self.agzo_param_map.get(param_name)
+        if param is None:
+            return None
+
+        activation_shape = activation.shape
+        if activation_shape[-1] == 0:
+            return None
+
+        activation_2d = activation.reshape(-1, activation_shape[-1]).float()
+        if activation_2d.shape[0] == 0:
+            return None
+
+        vector = self._agzo_power_iteration(activation_2d, getattr(self.args, "agzo_power_iter_steps", 5))
+        if vector is None:
+            return None
+
+        vector = vector / (vector.norm(p=2) + 1e-12)
+        return vector.to(device=param.device, dtype=param.dtype)
+
+    def _agzo_power_iteration(self, activation_2d: torch.Tensor, num_steps: int):
+        """AGZO: standard power iteration on A^T A."""
+        if activation_2d.shape[1] == 0:
+            return None
+        num_steps = max(1, int(num_steps))
+        v = torch.randn(activation_2d.shape[1], device=activation_2d.device, dtype=activation_2d.dtype)
+        v = v / (v.norm(p=2) + 1e-12)
+        for _ in range(num_steps):
+            v1 = activation_2d.transpose(0, 1).matmul(activation_2d.matmul(v))
+            norm = v1.norm(p=2)
+            if not torch.isfinite(norm) or norm.item() == 0:
+                break
+            v = v1 / (norm + 1e-12)
+        return v
+
+    def agzo_collect_basis(self, model, inputs):
+        """AGZO: run an additional forward pass to update u_l for each layer."""
+        self._ensure_agzo_hooks()
+        self.agzo_u.clear()
+        self.agzo_collecting = True
+        try:
+            # Reuse zo_forward to ensure identical preprocessing (dropout off, etc.)
+            _ = self.zo_forward(model, inputs)
+        finally:
+            self.agzo_collecting = False
+
+    def _agzo_sample_z(self, name: str, param: torch.nn.Parameter):
+        """AGZO: sample rank-1 perturbation using stored u_l; fallback to Gaussian if unavailable."""
+        u_vec = self.agzo_u.get(name)
+        if u_vec is None or param.dim() < 2:
+            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device,
+                             dtype=param.data.dtype)
+        else:
+            u_vec = u_vec.to(device=param.data.device, dtype=param.data.dtype)
+            r = torch.normal(mean=0, std=1, size=(param.data.shape[0],), device=param.data.device,
+                             dtype=param.data.dtype)
+            z = torch.outer(r, u_vec)
+        grad_sparsity = self.get_grad_sparsity_by_name(name)
+        if grad_sparsity is not None:
+            z[fast_random_mask_like(z, grad_sparsity, generator=self.sparse_grad_rng)] = 0
+        return z
+
+    def agzo_perturb_parameters(self, random_seed=None, scaling_factor=1):
+        """AGZO: apply rank-1 perturbation constructed from r_l and stored u_l."""
+        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+        self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
+
+        for name, param in self.named_parameters_to_optim:
+            z = self._agzo_sample_z(name, param)
+            param.data = param.data + scaling_factor * z * self.args.zo_eps
+
+    @torch.no_grad()
+    def agzo_step(self, model, inputs):
+        """AGZO: zeroth-order step with activation-guided perturbations."""
+        args = self.args
+        assert args.q == 1, "AGZO currently supports q=1"
+
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+                param.grad = None
+
+        self.agzo_collect_basis(model, inputs)
+        if len(self.agzo_u) == 0:
+            if not self._agzo_missing_activation_warned:
+                logger.warn("AGZO: 未捕获到任何激活，回退至MeZO扰动。")
+                self._agzo_missing_activation_warned = True
+            # AGZO: 由于未获取到激活，暂时复用原有MeZO逻辑，保留原函数调用以便比较
+            return self.zo_step(model, inputs)
+
+        self.zo_random_seed = np.random.randint(1000000000)
+        self.agzo_perturb_parameters(scaling_factor=1)
+        loss1 = self.zo_forward(model, inputs)
+
+        if self.args.perturbation_mode == "one_side":
+            self.agzo_perturb_parameters(scaling_factor=-1)
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
+        else:
+            self.agzo_perturb_parameters(scaling_factor=-2)
+            loss2 = self.zo_forward(model, inputs)
+            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+            self.agzo_perturb_parameters(scaling_factor=1)
+
+        torch.manual_seed(self.zo_random_seed)
+        self.sparse_grad_rng.manual_seed(self.sparse_grad_random_seed)
+        for name, param in self.named_parameters_to_optim:
+            z = self._agzo_sample_z(name, param)
+            param.grad = self.projected_grad * z
+            self.optimizer.step()
+            param.grad = None
+
+        assert self.args.gradient_accumulation_steps == 1
+
+        return loss1
 
     def zo_forward(self, model, inputs):
         """
