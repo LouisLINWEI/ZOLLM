@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+*.out
+
+# Virtual environment
+venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# System Files
+.DS_Store
+
+# Machine-specific files
+.idea
+*.iml
+.vscode
+
+# Temporary files
+*.tmp
+*.temp
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Python caches and test caches
+.cache/
+.pytest_cache/
+
+# Experiment/ML outputs
+log/
+logs/
+result/
+results/
+checkpoints/
+outputs/
+runs/
+wandb/
+*.wandb
+
+# Model weights/artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Environment files
+.env
+.env.*
+.venv/
+env/
+
+# Jupyter checkpoints (ensure directory form)
+.ipynb_checkpoints/
+
+# OS specific
+Thumbs.db
+
+# Shell outputs
+nohup.out
