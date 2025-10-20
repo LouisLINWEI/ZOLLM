@@ -338,6 +338,8 @@ class OurTrainer(Trainer):
                 self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
             elif args.optimizer == "sgd":
                 self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+        if args.trainer == "agzo":
+            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
 
         # important: at this point:
         # self.model         is the Transformers Model
