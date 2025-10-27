@@ -583,8 +583,6 @@ class OurTrainer(Trainer):
                     test_metrics = self.evaluate_func([], self.eval_samples)
                     if "accuracy" in test_metrics:
                         self.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]})
-                        wandb.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]},
-                                   step=self.state.global_step)
                     else:
                         keys = list(test_metrics.keys())
                         log_dict = {}
@@ -592,7 +590,6 @@ class OurTrainer(Trainer):
                             log_dict['test_' + k] = test_metrics[k]
                             log_dict['val_' + k] = val_metrics[k]
                         self.log(log_dict)
-                        wandb.log(log_dict, step=self.state.global_step)
 
                 max_memory_allocated = 0
                 for device_id in range(torch.cuda.device_count()):
@@ -600,9 +597,6 @@ class OurTrainer(Trainer):
                     max_memory_allocated += torch.cuda.max_memory_allocated(device_id)
                 self.log({"peak_mem": max_memory_allocated / 1024 ** 3,
                           "step_consumption": train_step_duration * 1000})
-                wandb.log({"peak_mem": max_memory_allocated / 1024 ** 3,
-                           "step_consumption": train_step_duration * 1000},
-                          step=self.state.global_step)
 
                 # AGZO: optionally empty CUDA cache to mitigate peak growth
                 if (
